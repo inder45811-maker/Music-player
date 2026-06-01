@@ -1,0 +1,383 @@
+// ===========================================================================
+// Social Music Player — Database Schema (Prisma / PostgreSQL)
+// ===========================================================================
+// This schema encodes the strict relational requirements of the platform:
+//   * Users + authentication (email/password and social logins)
+//   * Federated music-account links with server-side encrypted tokens
+//   * Follow graph + blocking (privacy severing)
+//   * Instagram-style posts (media-centric) with hashtags
+//   * Likes (one-per-user) and a fully relational Shares ledger for analytics
+//   * Notifications
+//   * Granular privacy settings
+//
+// Design notes:
+//   * All IDs are UUIDs (cuid()) to avoid enumeration attacks.
+//   * Join tables carry explicit @@unique constraints to enforce invariants
+//     at the database level (defence in depth, not just app logic).
+//   * The shares table is intentionally append-only and event-grained so it
+//     can power deep marketing/influencer analytics — NOT a simple counter.
+// ===========================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// Visibility level used by the granular privacy matrix.
+enum Visibility {
+  PUBLIC // visible to everyone
+  FOLLOWERS // visible only to accepted followers
+  PRIVATE // visible only to the owner
+}
+
+/// Supported external music providers for account federation + playback.
+enum MusicProvider {
+  SPOTIFY
+  SOUNDCLOUD
+  YOUTUBE
+  APPLE_MUSIC
+}
+
+/// Social login providers (distinct from music providers).
+enum AuthProvider {
+  GOOGLE
+  APPLE
+}
+
+/// The type of media a post points at, which drives the player engine choice.
+enum MediaType {
+  TRACK // a single song / track
+  ALBUM // an album / playlist artwork
+  VIDEO // a video (YouTube)
+}
+
+/// Social events surfaced by the notification engine.
+enum NotificationType {
+  NEW_FOLLOWER
+  POST_LIKE
+  POST_SHARE
+  HASHTAG_MENTION
+  FOLLOW_REQUEST
+}
+
+/// Destinations recorded for each individual share action. Granular by design
+/// so the analytics layer can segment virality by channel.
+enum ShareDestination {
+  INTERNAL_FEED // re-shared into the platform feed
+  DIRECT_MESSAGE
+  COPY_LINK
+  TWITTER
+  FACEBOOK
+  INSTAGRAM
+  WHATSAPP
+  EMAIL
+  OTHER
+}
+
+// ---------------------------------------------------------------------------
+// Users & Authentication
+// ---------------------------------------------------------------------------
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  emailVerifiedAt DateTime?
+  // Argon2id hash. Nullable because social-login-only accounts have no
+  // local password.
+  passwordHash    String?
+  username        String    @unique
+  displayName     String?
+  bio             String?   @db.Text
+  avatarUrl       String?
+
+  // Granular privacy matrix — each axis independently controllable.
+  profileVisibility  Visibility @default(PUBLIC)
+  postVisibility     Visibility @default(PUBLIC)
+  activityVisibility Visibility @default(FOLLOWERS)
+  // When true, follows require approval (private account flow).
+  isPrivate          Boolean    @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations -------------------------------------------------------------
+  sessions          Session[]
+  socialAccounts    SocialAccount[]
+  musicAccounts     MusicAccount[]
+  verificationTokens VerificationToken[]
+
+  posts          Post[]
+  likes          Like[]
+  shares         Share[]
+
+  // Follow graph (self-referential through the Follow join table).
+  following Follow[] @relation("Follower")
+  followers Follow[] @relation("Following")
+
+  // Blocking graph.
+  blocksInitiated Block[] @relation("Blocker")
+  blocksReceived  Block[] @relation("Blocked")
+
+  // Notifications addressed TO this user, and those this user triggered.
+  notifications      Notification[] @relation("NotificationRecipient")
+  notificationsCaused Notification[] @relation("NotificationActor")
+
+  @@index([username])
+  @@index([email])
+}
+
+/// Federated social-login identities (Google / Apple). Kept separate from the
+/// password credential so a user can attach multiple providers to one account.
+model SocialAccount {
+  id             String       @id @default(cuid())
+  userId         String
+  provider       AuthProvider
+  // Stable subject identifier returned by the IdP (e.g. Google `sub`).
+  providerUserId String
+  createdAt      DateTime     @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // One identity per provider account; one provider link per user.
+  @@unique([provider, providerUserId])
+  @@unique([userId, provider])
+  @@index([userId])
+}
+
+/// Linked premium music-provider accounts. Access/refresh tokens are stored
+/// ENCRYPTED at rest (the proxy decrypts only at call time). The client secret
+/// of each provider NEVER touches this table or the browser.
+model MusicAccount {
+  id                String        @id @default(cuid())
+  userId            String
+  provider          MusicProvider
+  providerUserId    String
+  // AES-GCM ciphertext (base64). Decryption key lives only in server env.
+  accessTokenEnc    String        @db.Text
+  refreshTokenEnc   String?       @db.Text
+  scope             String?
+  tokenExpiresAt    DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
+  @@index([userId])
+}
+
+/// Server-side session records. The opaque token sent to the browser is a
+/// random value; only its SHA-256 hash is persisted (so a DB leak cannot be
+/// replayed as a live session).
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Single-use tokens for email verification and password resets. Only the hash
+/// is stored. `purpose` distinguishes the flows.
+model VerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  purpose   String // 'EMAIL_VERIFY' | 'PASSWORD_RESET'
+  expiresAt DateTime
+  consumedAt DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Follow & Block graph
+// ---------------------------------------------------------------------------
+
+/// Directed follow edge: `followerId` follows `followingId`.
+/// `acceptedAt` supports private-account follow requests.
+model Follow {
+  id          String    @id @default(cuid())
+  followerId  String
+  followingId String
+  acceptedAt  DateTime? // null => pending request
+  createdAt   DateTime  @default(now())
+
+  follower  User @relation("Follower", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("Following", fields: [followingId], references: [id], onDelete: Cascade)
+
+  // Cannot follow the same person twice.
+  @@unique([followerId, followingId])
+  @@index([followingId])
+  @@index([followerId])
+}
+
+/// Block edge: `blockerId` has blocked `blockedId`. Presence severs all
+/// visibility/interaction in both directions at the query layer.
+model Block {
+  id        String   @id @default(cuid())
+  blockerId String
+  blockedId String
+  createdAt DateTime @default(now())
+
+  blocker User @relation("Blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("Blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@unique([blockerId, blockedId])
+  @@index([blockedId])
+  @@index([blockerId])
+}
+
+// ---------------------------------------------------------------------------
+// Posts, Hashtags, Likes, Shares
+// ---------------------------------------------------------------------------
+
+/// An Instagram-style post centred on a music/video media entity.
+model Post {
+  id        String    @id @default(cuid())
+  authorId  String
+
+  caption   String?   @db.Text
+
+  // --- Media entity (natively extracted from the linked music APIs) ------
+  provider     MusicProvider
+  mediaType    MediaType
+  // Provider-native id (Spotify track id, YouTube video id, etc.). Combined
+  // with `provider` it uniquely identifies the playable resource.
+  providerMediaId String
+  title        String
+  artist       String?
+  artworkUrl   String? // album cover / video thumbnail
+  durationMs   Int?
+  externalUrl  String? // canonical link on the provider
+
+  visibility Visibility @default(PUBLIC)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  author   User       @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  likes    Like[]
+  shares   Share[]
+  hashtags PostHashtag[]
+
+  @@index([authorId])
+  @@index([createdAt])
+  @@index([provider, providerMediaId])
+}
+
+/// Normalised hashtag, lower-cased and unique, for trend grouping/discovery.
+model Hashtag {
+  id        String        @id @default(cuid())
+  tag       String        @unique // stored without the leading '#', lower-cased
+  createdAt DateTime      @default(now())
+  posts     PostHashtag[]
+
+  @@index([tag])
+}
+
+/// Many-to-many join between posts and hashtags.
+model PostHashtag {
+  postId    String
+  hashtagId String
+
+  post    Post    @relation(fields: [postId], references: [id], onDelete: Cascade)
+  hashtag Hashtag @relation(fields: [hashtagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, hashtagId])
+  @@index([hashtagId])
+}
+
+/// Like edge. The composite unique enforces the strict one-like-per-user rule.
+model Like {
+  id        String   @id @default(cuid())
+  userId    String
+  postId    String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, postId])
+  // Index tuned for "count likes of a post" + "has this user liked it".
+  @@index([postId])
+  @@index([userId])
+}
+
+/// Fully relational, event-grained Shares ledger — explicitly NOT a counter.
+/// Every individual share action is a row, enabling deep marketing analytics,
+/// ad targeting, viral-trend and influencer attribution.
+model Share {
+  id          String           @id @default(cuid())
+  userId      String
+  postId      String
+  destination ShareDestination
+
+  // --- Marketing / attribution dimensions --------------------------------
+  // The post author at time of share (influencer attribution even if the post
+  // is later transferred/deleted-soft).
+  postAuthorId String?
+  // UTM-style campaign context if the share originated from a campaign.
+  campaign     String?
+  // Referrer / surface the share happened on (e.g. 'feed', 'profile', 'search').
+  surface      String?
+  // Hashed/anonymised session correlation id for funnel analysis.
+  sessionRef   String?
+  // Free-form JSON for additional analytics dimensions (device, geo bucket…).
+  metadata     Json?
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  // Analytics-oriented indexes. Note: NO unique constraint — repeat shares are
+  // meaningful signal and must all be retained.
+  @@index([postId])
+  @@index([userId])
+  @@index([destination])
+  @@index([postAuthorId])
+  @@index([campaign])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+/// A social-event notification addressed to `recipientId`, optionally caused by
+/// `actorId` and referencing a post. Polled or pushed by the notification engine.
+model Notification {
+  id          String           @id @default(cuid())
+  recipientId String
+  actorId     String?
+  type        NotificationType
+  postId      String?
+  // Denormalised snippet so the feed renders without extra joins.
+  preview     String?
+  readAt      DateTime?
+  createdAt   DateTime         @default(now())
+
+  recipient User  @relation("NotificationRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  actor     User? @relation("NotificationActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([recipientId, readAt])
+  @@index([createdAt])
+}
