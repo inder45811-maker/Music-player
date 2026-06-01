@@ -40,9 +40,9 @@
 
 <style>
   .feed {
-    max-width: 520px;
+    max-width: 600px;
     margin: 0 auto;
-    padding: 1rem;
+    padding: 0 0 1rem;
   }
   .status {
     text-align: center;
